@@ -1,0 +1,273 @@
+"""
+Unit tests for parsers and knowledge base.
+These tests use mock Claude responses so they don't consume API credits.
+Run with: pytest tests/ -v
+"""
+
+import json
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from shared.models import (
+    AuditResult,
+    BillLineItem,
+    ConfidenceLevel,
+    ParsedBill,
+    ParsedDischargeSummary,
+    ParsedPolicy,
+)
+
+
+# ── Fixtures ──────────────────────────────────────────────────────────────────
+
+@pytest.fixture
+def sample_bill() -> ParsedBill:
+    return ParsedBill(
+        hospital_name="City Care Hospital",
+        patient_name="Ramesh Kumar",
+        total_billed=487000.0,
+        insurer_approved=294000.0,
+        patient_demand=193000.0,
+        line_items=[
+            BillLineItem(description="CT Scan Chest", billed_amount=19000.0),
+            BillLineItem(description="ICU Charges per day", billed_amount=35000.0),
+            BillLineItem(description="Specialist Consultation", billed_amount=8000.0),
+            BillLineItem(description="ICU Consumables", billed_amount=67000.0),
+            BillLineItem(description="Nursing Charges", billed_amount=15000.0),
+        ],
+        raw_text="Sample raw text",
+    )
+
+
+@pytest.fixture
+def sample_discharge() -> ParsedDischargeSummary:
+    return ParsedDischargeSummary(
+        diagnosis="Acute Gastritis",
+        admission_date="2025-01-10",
+        discharge_date="2025-01-13",
+        icu_days=3,
+        specialists_mentioned=["Dr. Sharma (Gastroenterologist)", "Dr. Patel (Cardiologist)"],
+        procedures_listed=["CT Scan Chest", "2D Echo", "ECG"],
+        medicines_prescribed=["Pantoprazole 40mg", "Ondansetron 4mg"],
+        raw_text="Sample discharge text",
+    )
+
+
+@pytest.fixture
+def sample_policy() -> ParsedPolicy:
+    return ParsedPolicy(
+        insurer_name="Star Health Insurance",
+        policy_number="POL-2024-98765",
+        sum_insured=500000.0,
+        room_rent_limit=3000.0,
+        exclusions=["Cosmetic surgery", "Dental treatment"],
+        raw_text="Sample policy text",
+    )
+
+
+# ── Knowledge base tests ──────────────────────────────────────────────────────
+
+class TestKnowledgeBase:
+    def test_cghs_lookup_exact_match(self):
+        from ingestion.knowledge_base import lookup_cghs_rate
+        rate, key = lookup_cghs_rate("CT Scan Chest")
+        assert rate == 2500.0
+        assert "CT Scan" in key
+
+    def test_cghs_lookup_fuzzy_match(self):
+        from ingestion.knowledge_base import lookup_cghs_rate
+        # Slightly different name — should still match
+        rate, key = lookup_cghs_rate("CT Chest Scan")
+        assert rate is not None
+
+    def test_cghs_lookup_no_match(self):
+        from ingestion.knowledge_base import lookup_cghs_rate
+        rate, key = lookup_cghs_rate("xyzzy_completely_unknown_procedure_12345")
+        assert rate is None
+        assert key is None
+
+    def test_nppa_lookup_found(self):
+        from ingestion.knowledge_base import lookup_nppa_cap
+        cap = lookup_nppa_cap("Metformin 500mg Tab")
+        assert cap == 2.5
+
+    def test_nppa_lookup_not_found(self):
+        from ingestion.knowledge_base import lookup_nppa_cap
+        cap = lookup_nppa_cap("Unicorn Dust 100mg")
+        assert cap is None
+
+    def test_irdai_rules_loaded(self):
+        from ingestion.knowledge_base import get_irdai_rules
+        rules = get_irdai_rules()
+        assert len(rules) > 0
+        assert all("rule" in r for r in rules)
+        assert all("circular_ref" in r for r in rules)
+
+
+# ── Model validation tests ────────────────────────────────────────────────────
+
+class TestModels:
+    def test_bill_line_item_defaults(self):
+        item = BillLineItem(description="Test item", billed_amount=1000.0)
+        assert item.confidence == ConfidenceLevel.UNVERIFIABLE
+        assert item.cghs_rate is None
+        assert item.overcharge_amount is None
+
+    def test_parsed_bill_creation(self, sample_bill):
+        assert sample_bill.patient_demand == 193000.0
+        assert len(sample_bill.line_items) == 5
+
+    def test_confidence_level_values(self):
+        assert ConfidenceLevel.VERIFIED_OVERCHARGE == "verified_overcharge"
+        assert ConfidenceLevel.SUSPECTED_OVERCHARGE == "suspected_overcharge"
+        assert ConfidenceLevel.UNVERIFIABLE == "unverifiable"
+        assert ConfidenceLevel.APPEARS_FAIR == "appears_fair"
+
+    def test_full_analysis_contestable_amount(
+        self, sample_bill, sample_discharge, sample_policy
+    ):
+        from shared.models import (
+            AuditResult,
+            ContradictionResult,
+            FullAnalysis,
+            PolicyCheckResult,
+        )
+
+        audit = AuditResult(
+            verified_overcharge_total=50000.0,
+            suspected_overcharge_total=30000.0,
+            unverifiable_total=20000.0,
+            line_items=[],
+            summary="Test summary",
+        )
+        policy_check = PolicyCheckResult(
+            wrongful_rejections=["Non-payable items wrongfully rejected"],
+            valid_rejections=[],
+            irdai_violations=["IRDAI/HLT/REG/CIR/170/06/2025 Clause 4.1"],
+            recoverable_amount=40000.0,
+            summary="Test policy summary",
+        )
+        contradictions = ContradictionResult(
+            contradictions_found=True,
+            specialist_discrepancy="bill: 8 consultations, discharge: 2 doctors",
+            summary="Significant discrepancy found",
+        )
+        analysis = FullAnalysis(
+            parsed_bill=sample_bill,
+            parsed_policy=sample_policy,
+            audit=audit,
+            policy_check=policy_check,
+            contradictions=contradictions,
+            total_contestable_amount=90000.0,
+        )
+        assert analysis.total_contestable_amount == 90000.0
+        assert analysis.contradictions.contradictions_found is True
+
+
+# ── OCR tests (mocked) ────────────────────────────────────────────────────────
+
+class TestOCR:
+    def test_unsupported_file_type_raises(self):
+        from ingestion.ocr import extract_text_from_file
+        with pytest.raises(ValueError, match="Unsupported file type"):
+            extract_text_from_file(b"data", "document.docx")
+
+    @patch("ingestion.ocr.client")
+    def test_image_extraction_calls_claude(self, mock_client):
+        mock_response = MagicMock()
+        mock_response.content = [MagicMock(text="Extracted text from image")]
+        mock_client.messages.create.return_value = mock_response
+
+        from ingestion.ocr import _extract_from_image
+        result = _extract_from_image(b"fake_image_bytes", ".png")
+        assert result == "Extracted text from image"
+        mock_client.messages.create.assert_called_once()
+
+
+# ── Parser tests (mocked) ─────────────────────────────────────────────────────
+
+class TestParsers:
+    @patch("ingestion.parsers.client")
+    def test_parse_bill_returns_parsed_bill(self, mock_client):
+        mock_bill_json = {
+            "hospital_name": "Test Hospital",
+            "patient_name": "Test Patient",
+            "total_billed": 100000.0,
+            "insurer_approved": 60000.0,
+            "patient_demand": 40000.0,
+            "line_items": [
+                {"description": "CT Scan", "billed_amount": 10000.0, "quantity": 1}
+            ],
+        }
+        mock_response = MagicMock()
+        mock_response.content = [MagicMock(text=json.dumps(mock_bill_json))]
+        mock_client.messages.create.return_value = mock_response
+
+        from ingestion.parsers import parse_bill
+        result = parse_bill("raw bill text")
+        assert isinstance(result, ParsedBill)
+        assert result.hospital_name == "Test Hospital"
+        assert result.patient_demand == 40000.0
+        assert len(result.line_items) == 1
+
+    @patch("ingestion.parsers.client")
+    def test_parse_discharge_returns_model(self, mock_client):
+        mock_discharge_json = {
+            "diagnosis": "Acute Gastritis",
+            "admission_date": "2025-01-10",
+            "discharge_date": "2025-01-13",
+            "icu_days": 3,
+            "specialists_mentioned": ["Dr. Sharma"],
+            "procedures_listed": ["CT Scan"],
+            "medicines_prescribed": ["Pantoprazole"],
+        }
+        mock_response = MagicMock()
+        mock_response.content = [MagicMock(text=json.dumps(mock_discharge_json))]
+        mock_client.messages.create.return_value = mock_response
+
+        from ingestion.parsers import parse_discharge_summary
+        result = parse_discharge_summary("raw discharge text")
+        assert isinstance(result, ParsedDischargeSummary)
+        assert result.icu_days == 3
+
+
+# ── Contradiction detector tests (mocked) ────────────────────────────────────
+
+class TestContradictionDetector:
+    @patch("reasoning.contradiction_detector.client")
+    def test_detects_specialist_mismatch(
+        self, mock_client, sample_bill, sample_discharge
+    ):
+        mock_result = {
+            "specialist_discrepancy": "bill: 8 consultations, discharge: 2 doctors",
+            "medicine_discrepancy": None,
+            "procedure_discrepancy": None,
+            "contradictions_found": True,
+            "summary": "Significant specialist discrepancy found.",
+        }
+        mock_response = MagicMock()
+        mock_response.content = [MagicMock(text=json.dumps(mock_result))]
+        mock_client.messages.create.return_value = mock_response
+
+        from reasoning.contradiction_detector import detect_contradictions
+        result = detect_contradictions(sample_bill, sample_discharge)
+        assert result.contradictions_found is True
+        assert result.specialist_discrepancy is not None
+
+    @patch("reasoning.contradiction_detector.client")
+    def test_no_contradictions(self, mock_client, sample_bill, sample_discharge):
+        mock_result = {
+            "specialist_discrepancy": None,
+            "medicine_discrepancy": None,
+            "procedure_discrepancy": None,
+            "contradictions_found": False,
+            "summary": "No significant contradictions found.",
+        }
+        mock_response = MagicMock()
+        mock_response.content = [MagicMock(text=json.dumps(mock_result))]
+        mock_client.messages.create.return_value = mock_response
+
+        from reasoning.contradiction_detector import detect_contradictions
+        result = detect_contradictions(sample_bill, sample_discharge)
+        assert result.contradictions_found is False

@@ -1,0 +1,84 @@
+from pydantic import BaseModel
+from typing import Optional
+from enum import Enum
+
+
+class ConfidenceLevel(str, Enum):
+    VERIFIED_OVERCHARGE = "verified_overcharge"
+    SUSPECTED_OVERCHARGE = "suspected_overcharge"
+    UNVERIFIABLE = "unverifiable"
+    APPEARS_FAIR = "appears_fair"
+
+
+class BillLineItem(BaseModel):
+    description: str
+    billed_amount: float
+    quantity: int = 1
+    cghs_rate: Optional[float] = None        # None = no benchmark found
+    nppa_cap: Optional[float] = None
+    overcharge_amount: Optional[float] = None
+    confidence: ConfidenceLevel = ConfidenceLevel.UNVERIFIABLE
+    flag_reason: Optional[str] = None
+
+
+class ParsedBill(BaseModel):
+    hospital_name: str
+    patient_name: str
+    total_billed: float
+    insurer_approved: float
+    patient_demand: float                    # what hospital is asking patient to pay
+    line_items: list[BillLineItem]
+    raw_text: str
+
+
+class ParsedDischargeSummary(BaseModel):
+    diagnosis: str
+    admission_date: str
+    discharge_date: str
+    icu_days: int
+    specialists_mentioned: list[str]
+    procedures_listed: list[str]
+    medicines_prescribed: list[str]
+    raw_text: str
+
+
+class ParsedPolicy(BaseModel):
+    insurer_name: str
+    policy_number: str
+    sum_insured: float
+    room_rent_limit: Optional[float] = None
+    exclusions: list[str]
+    raw_text: str
+
+
+class AuditResult(BaseModel):
+    verified_overcharge_total: float
+    suspected_overcharge_total: float
+    unverifiable_total: float
+    line_items: list[BillLineItem]
+    summary: str                             # plain language, for patient
+
+
+class PolicyCheckResult(BaseModel):
+    wrongful_rejections: list[str]           # rejections that violate IRDAI
+    valid_rejections: list[str]
+    irdai_violations: list[str]              # specific circular references
+    recoverable_amount: float
+    summary: str
+
+
+class ContradictionResult(BaseModel):
+    specialist_discrepancy: Optional[str] = None   # e.g. "bill: 8, summary: 2"
+    medicine_discrepancy: Optional[str] = None
+    procedure_discrepancy: Optional[str] = None
+    contradictions_found: bool = False
+    summary: str
+
+
+class FullAnalysis(BaseModel):
+    parsed_bill: ParsedBill
+    parsed_policy: ParsedPolicy
+    audit: AuditResult
+    policy_check: PolicyCheckResult
+    contradictions: ContradictionResult
+    total_contestable_amount: float

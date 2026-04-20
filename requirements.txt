@@ -1,0 +1,116 @@
+"""
+Letter generator: produces two targeted dispute documents.
+
+  1. Hospital dispute letter   — handed to billing manager at counter
+  2. Insurer escalation notice — sent to insurer's grievance cell
+"""
+
+import logging
+from datetime import date
+
+import anthropic
+
+from reasoning.prompts import HOSPITAL_LETTER_SYSTEM_PROMPT, INSURER_LETTER_SYSTEM_PROMPT
+from shared.config import ANTHROPIC_API_KEY, CLAUDE_MODEL
+from shared.models import ConfidenceLevel, FullAnalysis
+
+logger = logging.getLogger(__name__)
+client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+
+def generate_hospital_letter(analysis: FullAnalysis) -> str:
+    """
+    Generate a formal but non-aggressive dispute letter to the hospital billing manager.
+    Cites specific overcharged line items with CGHS benchmark comparisons.
+    """
+    overcharged_items = [
+        item
+        for item in analysis.audit.line_items
+        if item.confidence == ConfidenceLevel.VERIFIED_OVERCHARGE
+    ]
+
+    suspected_items = [
+        item
+        for item in analysis.audit.line_items
+        if item.confidence == ConfidenceLevel.SUSPECTED_OVERCHARGE
+    ]
+
+    item_details = "\n".join(
+        f"- {item.description}: billed ₹{item.billed_amount:,.0f}"
+        + (f", CGHS benchmark ₹{item.cghs_rate:,.0f}" if item.cghs_rate else "")
+        + (f", overcharge ₹{item.overcharge_amount:,.0f}" if item.overcharge_amount else "")
+        for item in overcharged_items
+    )
+
+    suspected_details = "\n".join(
+        f"- {item.description}: ₹{item.billed_amount:,.0f} — {item.flag_reason or 'insufficient breakdown provided'}"
+        for item in suspected_items
+    )
+
+    context = f"""
+Date: {date.today().strftime("%d %B %Y")}
+Hospital: {analysis.parsed_bill.hospital_name}
+Patient: {analysis.parsed_bill.patient_name}
+Total billed: ₹{analysis.parsed_bill.total_billed:,.0f}
+Amount demanded from patient: ₹{analysis.parsed_bill.patient_demand:,.0f}
+
+Verified overcharged items (with CGHS benchmark evidence):
+{item_details if item_details else "None with full benchmark data"}
+
+Items with insufficient breakdown (suspected overcharges):
+{suspected_details if suspected_details else "None"}
+
+Contradictions found: {analysis.contradictions.contradictions_found}
+Specialist discrepancy: {analysis.contradictions.specialist_discrepancy or "None"}
+
+Total contestable amount: ₹{analysis.total_contestable_amount:,.0f}
+"""
+
+    response = client.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=800,
+        system=HOSPITAL_LETTER_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": context}],
+    )
+
+    logger.info("Hospital dispute letter generated")
+    return response.content[0].text
+
+
+def generate_insurer_letter(analysis: FullAnalysis) -> str:
+    """
+    Generate a formal IRDAI-citing escalation notice to the insurer.
+    References specific circular numbers and wrongful rejection reasons.
+    """
+    context = f"""
+Date: {date.today().strftime("%d %B %Y")}
+Insurer: {analysis.parsed_policy.insurer_name}
+Policy number: {analysis.parsed_policy.policy_number}
+Patient: {analysis.parsed_bill.patient_name}
+Hospital: {analysis.parsed_bill.hospital_name}
+
+Total billed: ₹{analysis.parsed_bill.total_billed:,.0f}
+Insurer approved: ₹{analysis.parsed_bill.insurer_approved:,.0f}
+Amount rejected: ₹{analysis.parsed_bill.total_billed - analysis.parsed_bill.insurer_approved:,.0f}
+
+Wrongful rejections identified:
+{chr(10).join(f"- {r}" for r in analysis.policy_check.wrongful_rejections) or "None identified"}
+
+Valid rejections (not contested):
+{chr(10).join(f"- {r}" for r in analysis.policy_check.valid_rejections) or "None"}
+
+IRDAI violations by insurer:
+{chr(10).join(f"- {v}" for v in analysis.policy_check.irdai_violations) or "None identified"}
+
+Estimated recoverable amount: ₹{analysis.policy_check.recoverable_amount:,.0f}
+"""
+
+    response = client.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=800,
+        system=INSURER_LETTER_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": context}],
+    )
+
+    logger.info("Insurer escalation notice generated")
+    return response.content[0].text

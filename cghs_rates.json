@@ -1,0 +1,20 @@
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Anthropic
+ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
+CLAUDE_MODEL: str = "claude-sonnet-4-20250514"
+MAX_TOKENS: int = 1000
+
+# Knowledge base
+CGHS_CONFIDENCE_THRESHOLD: float = float(os.getenv("CGHS_CONFIDENCE_THRESHOLD", "0.6"))
+OVERCHARGE_THRESHOLD: float = 0.30    # flag if billed > benchmark by 30%+
+
+# Paths
+DATA_DIR: str = "data"
+CHROMA_DIR: str = ".chroma_db"
+
+# Logging
+LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")

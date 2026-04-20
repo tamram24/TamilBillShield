@@ -1,0 +1,97 @@
+"""
+Knowledge base builder script.
+
+Run this on Day 1 before starting development.
+Verifies that data files exist and are well-formed.
+Optionally fetches and parses CGHS/NPPA data from public sources.
+
+Usage:
+    python scripts/build_knowledge_base.py [--verify-only]
+"""
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+DATA_DIR = Path("data")
+REQUIRED_FILES = ["cghs_rates.json", "nppa_caps.json", "irdai_rules.json"]
+
+
+def verify_data_files() -> bool:
+    """Check that all required data files exist and are valid JSON."""
+    all_ok = True
+    for filename in REQUIRED_FILES:
+        path = DATA_DIR / filename
+        if not path.exists():
+            print(f"  MISSING: {path}")
+            all_ok = False
+            continue
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            count = len(data)
+            print(f"  OK: {path} ({count} entries)")
+        except json.JSONDecodeError as e:
+            print(f"  INVALID JSON: {path} — {e}")
+            all_ok = False
+    return all_ok
+
+
+def print_sample_lookups():
+    """Demo the knowledge base lookups."""
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    from ingestion.knowledge_base import get_irdai_rules, lookup_cghs_rate, lookup_nppa_cap
+
+    print("\nSample CGHS lookups:")
+    tests = ["CT Scan Chest", "ICU Charges per day", "Specialist Consultation", "Unknown Procedure"]
+    for proc in tests:
+        rate, key = lookup_cghs_rate(proc)
+        if rate:
+            print(f"  '{proc}' → matched '{key}': ₹{rate:,.0f}")
+        else:
+            print(f"  '{proc}' → no match found")
+
+    print("\nSample NPPA lookups:")
+    meds = ["Metformin 500mg Tab", "Pantoprazole 40mg Inj", "Unknown Drug 100mg"]
+    for med in meds:
+        cap = lookup_nppa_cap(med)
+        print(f"  '{med}' → {'₹' + str(cap) + '/unit' if cap else 'not in NPPA list'}")
+
+    print(f"\nIRDAI rules loaded: {len(get_irdai_rules())} rules")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Build and verify MediSafe knowledge base")
+    parser.add_argument(
+        "--verify-only",
+        action="store_true",
+        help="Only verify existing files, don't attempt to fetch new data",
+    )
+    args = parser.parse_args()
+
+    print("=" * 55)
+    print("MediSafe Knowledge Base Builder")
+    print("=" * 55)
+
+    print(f"\nVerifying data files in {DATA_DIR}/...")
+    ok = verify_data_files()
+
+    if not ok:
+        print(
+            "\n  Some files are missing. The starter data files are included in the repo."
+            "\n  To expand coverage, download the latest CGHS rate schedule from cghs.nic.in"
+            "\n  and the NPPA drug price list from nppaindia.nic.in, then update the JSON files."
+        )
+        sys.exit(1)
+
+    if not args.verify_only:
+        print("\nRunning sample lookups...")
+        print_sample_lookups()
+
+    print("\nKnowledge base is ready.")
+    print("=" * 55)
+
+
+if __name__ == "__main__":
+    main()
